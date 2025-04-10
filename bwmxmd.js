@@ -6,10 +6,13 @@ const PORT = process.env.PORT || 8000;
 let server = require('./qr'),
     code = require('./pair');
 require('events').EventEmitter.defaultMaxListeners = 500;
-app.use('/qr', server);
+app.use('/server', server);
 app.use('/code', code);
 app.use('/pair',async (req, res, next) => {
 res.sendFile(__path + '/pair.html')
+})
+app.use('/qr',async (req, res, next) => {
+res.sendFile(__path + '/qr.html')
 })
 app.use('/',async (req, res, next) => {
 res.sendFile(__path + '/index.html')
@@ -18,11 +21,9 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.listen(PORT, () => {
     console.log(`
-Bwm xmd scanner online ✅
+Don't Forgot To Give Star.
 
-Made by Ibrahim Adams
-
-Server running on http://localhost:` + PORT)
+ Server running on http://localhost:` + PORT)
 })
 
 module.exports = app
