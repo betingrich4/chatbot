@@ -1,240 +1,197 @@
 const express = require('express');
 const fs = require('fs');
-const path = require('path');
+const zlib = require('zlib');
+const fetch = require('node-fetch');
+const pino = require("pino");
 const { makeid } = require('./gen-id');
 const { upload } = require('./mega');
-const pino = require("pino");
-const { 
-    makeWASocket, 
-    useMultiFileAuthState, 
-    delay, 
-    Browsers, 
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    delay,
+    Browsers,
     makeCacheableSignalKeyStore,
-    DisconnectReason
+    DisconnectReason,
+    getContentType,
 } = require('@whiskeysockets/baileys');
-const axios = require('axios');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const router = express.Router();
 
-// Global state
-let botState = {
-    isChatbotActive: true,
-    currentSession: null,
-    lastBioUpdate: null
-};
+let isChatbotActive = true; // Default chatbot state
 
-// Session configuration
-const SESSION_TEMP_DIR = './temp';
-const SESSION_PREFIX = 'CRISS-AI-';
-
-// Initialize Express
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Helper functions
 function removeFile(FilePath) {
-    if (!fs.existsSync(FilePath)) return false;
-    fs.rmSync(FilePath, { recursive: true, force: true });
+    if (fs.existsSync(FilePath)) fs.rmSync(FilePath, { recursive: true, force: true });
 }
 
-function selectRandomItem(array) {
-    return array[Math.floor(Math.random() * array.length)];
+function getCurrentDateTime() {
+    const options = {
+        timeZone: 'Africa/Nairobi',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    };
+    return new Intl.DateTimeFormat('en-KE', options).format(new Date());
 }
 
-function generateRandomSessionId() {
-    const prefix = "3EB";
-    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let randomText = prefix;
-    for (let i = prefix.length; i < 22; i++) {
-        randomText += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return randomText;
+async function startAutoBioUpdate(bot) {
+    setInterval(async () => {
+        const bioText = `GIFTED-MD is online! 🚀\n"${getCurrentDateTime()}"`;
+        await bot.updateProfileStatus(bioText);
+        console.log(`Updated Bio: ${bioText}`);
+    }, 60000);
 }
 
-// 1. Session Initialization
-async function initializeWhatsAppSession() {
-    const sessionId = makeid();
-    const sessionDir = path.join(SESSION_TEMP_DIR, sessionId);
-    
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    
-    const sock = makeWASocket({
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" })),
-        },
-        printQRInTerminal: false,
-        generateHighQualityLinkPreview: true,
-        logger: pino({ level: "fatal" }),
-        syncFullHistory: false,
-        browser: Browsers.macOS(selectRandomItem(["Safari"]))
-    });
+async function handleChatbotMessage(bot, message) {
+    const remoteJid = message.key.remoteJid;
+    const messageContent = message.message.conversation || message.message.extendedTextMessage?.text;
 
-    sock.ev.on('creds.update', saveCreds);
-    
-    return { sock, sessionDir };
-}
+    if (message.key.fromMe) return;
 
-// 2. Chatbot Core Functionality
-async function setupChatbotHandlers(sock) {
-    // Message handler
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const message = messages[0];
-        if (!message.message) return;
+    try {
+        const apiUrl = 'https://api.gurusensei.workers.dev/llama';
+        const response = await fetch(`${apiUrl}?prompt=${encodeURIComponent(messageContent)}`);
+        const data = await response.json();
 
-        const text = message.message.conversation || '';
-        const sender = message.key.remoteJid;
-
-        // Command handling
-        if (text.startsWith('!')) {
-            await handleCommand(sock, sender, text);
-            return;
-        }
-
-        // Regular message processing
-        if (botState.isChatbotActive) {
-            await processMessage(sock, sender, text);
-        }
-    });
-
-    // Connection handler
-    sock.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect } = update;
-        
-        if (connection === "open") {
-            console.log(`✅ Connected as ${sock.user.id}`);
-            
-            // Auto-bio update
-            setInterval(() => updateBio(sock), 60000);
-            
-            // Session backup
-            await backupSession(sock);
-        } 
-        else if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {
-            console.log("Connection closed, reconnecting...");
+        if (data && data.response?.response) {
+            const replyText = data.response.response;
+            await bot.sendPresenceUpdate("composing", remoteJid);
             await delay(1000);
-            setupChatbotHandlers(sock);
+            await bot.sendMessage(remoteJid, { text: replyText });
+        } else {
+            throw new Error('Invalid response from GPT API.');
         }
-    });
-}
-
-// 3. Command Handling
-async function handleCommand(sock, sender, command) {
-    command = command.toLowerCase().trim();
-    
-    switch(command) {
-        case '!chatbot on':
-            botState.isChatbotActive = true;
-            await sock.sendMessage(sender, { text: '🤖 Chatbot activated' });
-            break;
-            
-        case '!chatbot off':
-            botState.isChatbotActive = false;
-            await sock.sendMessage(sender, { text: '🤖 Chatbot deactivated' });
-            break;
-            
-        case '!status':
-            const status = botState.isChatbotActive ? 'active ✅' : 'inactive ❌';
-            await sock.sendMessage(sender, { 
-                text: `Bot Status: ${status}\nLast Bio Update: ${botState.lastBioUpdate || 'Never'}` 
-            });
-            break;
-            
-        default:
-            await sock.sendMessage(sender, { text: 'Unknown command. Try !chatbot on/off' });
+    } catch (err) {
+        console.error("CHATBOT Error:", err.message);
+        await bot.sendMessage(remoteJid, {
+            text: "Sorry, I couldn't process your message. Please try again later."
+        });
     }
 }
 
-// 4. Message Processing
-async function processMessage(sock, sender, text) {
-    try {
-        const response = await axios.post('https://api.gurusensei.workers.dev/llama', {
-            message: text
-        });
+async function handleCommand(bot, message) {
+    const remoteJid = message.key.remoteJid;
+    const messageContent = message.message.conversation || message.message.extendedTextMessage?.text;
 
-        await sock.sendMessage(sender, { 
-            text: response.data.response,
-            contextInfo: {
-                externalAdReply: {
-                    title: "CRISS-AI Response",
-                    body: "Powered by Llama API",
-                    thumbnailUrl: "https://files.catbox.moe/gs8gi2.jpg",
-                    sourceUrl: "https://whatsapp.com/channel/0029Vb0HIV2G3R3s2II4181g"
+    if (messageContent?.startsWith('!chatbot')) {
+        const args = messageContent.split(' ');
+        const command = args[1];
+
+        if (command === 'on') {
+            isChatbotActive = true;
+            await bot.sendMessage(remoteJid, { text: 'Chatbot has been activated!' });
+        } else if (command === 'off') {
+            isChatbotActive = false;
+            await bot.sendMessage(remoteJid, { text: 'Chatbot has been deactivated!' });
+        } else {
+            await bot.sendMessage(remoteJid, { text: 'Usage: !chatbot [on/off]' });
+        }
+    }
+}
+
+router.get('/', async (req, res) => {
+    const id = makeid();
+    const num = req.query.number.replace(/[^0-9]/g, '');
+
+    async function GIFTED_MD_PAIR_CODE() {
+        const sessionPath = './temp/' + id;
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+
+        try {
+            const sock = makeWASocket({
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+                },
+                printQRInTerminal: false,
+                generateHighQualityLinkPreview: true,
+                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+                browser: Browsers.macOS('Safari'),
+            });
+
+            sock.ev.on('creds.update', saveCreds);
+
+            sock.ev.on("connection.update", async (s) => {
+                const { connection, lastDisconnect } = s;
+
+                if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {
+                    console.log("Reconnecting...");
+                    await delay(10000);
+                    GIFTED_MD_PAIR_CODE();
                 }
+
+                if (connection === "open") {
+                    console.log("Connected successfully!");
+                    startAutoBioUpdate(sock);
+
+                    await sock.sendMessage(sock.user.id, {
+                        text: "GIFTED-MD is successfully connected and session is retained!"
+                    });
+
+                    res.send({ message: "Bot connected successfully and session retained." });
+                }
+            });
+
+            if (!sock.authState.creds.registered) {
+                const code = await sock.requestPairingCode(num);
+                console.log("Pairing code generated:", code);
+                return res.send({ pairingCode: code });
             }
-        });
-    } catch (error) {
-        console.error('API error:', error);
-        await sock.sendMessage(sender, { text: '⚠️ Error processing your message' });
-    }
-}
 
-// 5. Session Backup
-async function backupSession(sock) {
-    try {
-        const sessionId = generateRandomSessionId();
-        const credsPath = path.join(SESSION_TEMP_DIR, sock.user.id, 'creds.json');
-        
-        if (fs.existsSync(credsPath)) {
-            const megaUrl = await upload(fs.createReadStream(credsPath), `${sessionId}.json`);
-            const sessionCode = SESSION_PREFIX + megaUrl.replace('https://mega.nz/file/', '');
-            
-            await sock.sendMessage(sock.user.id, { 
-                text: sessionCode,
-                contextInfo: {
-                    externalAdReply: {
-                        title: "Session Backup",
-                        thumbnailUrl: "https://files.catbox.moe/gs8gi2.jpg",
-                        sourceUrl: "https://github.com/criss-vevo/CRISS-AI"
-                    }
+            sock.ev.on("messages.upsert", async ({ messages }) => {
+                const ms = messages[0];
+                if (!ms.message) return;
+
+                const messageType = Object.keys(ms.message)[0];
+                const remoteJid = ms.key.remoteJid;
+
+                if (remoteJid === "status@broadcast") {
+                    await sock.readMessages([ms.key]);
+                }
+
+                if (["conversation", "extendedTextMessage"].includes(messageType)) {
+                    await sock.sendPresenceUpdate("composing", remoteJid);
+                    await handleCommand(sock, ms);
+                    if (isChatbotActive) await handleChatbotMessage(sock, ms);
                 }
             });
-            
-            botState.currentSession = sessionCode;
+
+        } catch (err) {
+            console.log("Service restarted due to error:", err.message);
+            removeFile(sessionPath + "/creds.json");
+            if (!res.headersSent) res.send({ error: "Service is Currently Unavailable" });
         }
-    } catch (error) {
-        console.error('Session backup failed:', error);
     }
-}
 
-// 6. Bio Update
-async function updateBio(sock) {
-    try {
-        const now = new Date().toLocaleString();
-        await sock.updateProfileStatus(`🤖 Active | ${now}`);
-        botState.lastBioUpdate = now;
-    } catch (error) {
-        console.error('Bio update failed:', error);
-    }
-}
-
-// Main initialization
-async function startBot() {
-    try {
-        const { sock, sessionDir } = await initializeWhatsAppSession();
-        botState.currentSession = sessionDir;
-        
-        await setupChatbotHandlers(sock);
-        
-        // Cleanup on exit
-        process.on('exit', () => {
-            removeFile(sessionDir);
-        });
-        
-        return sock;
-    } catch (error) {
-        console.error('Bot initialization failed:', error);
-        process.exit(1);
-    }
-}
-
-// Start the server and bot
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    startBot().then(() => {
-        console.log('WhatsApp bot initialized');
-    });
+    GIFTED_MD_PAIR_CODE();
 });
 
-module.exports = app;
+// Optional: auto decompress session file if needed
+async function authentification() {
+    const sessionPath = './Session/creds.json';
+
+    try {
+        if (fs.existsSync(sessionPath)) {
+            const sessionData = fs.readFileSync(sessionPath, "utf8");
+            const [header, b64data] = sessionData.split(';;;');
+
+            if (header === "BWM-XMD" && b64data) {
+                const compressedData = Buffer.from(b64data.replace('...', ''), 'base64');
+                const decompressedData = zlib.gunzipSync(compressedData);
+                fs.writeFileSync(sessionPath, decompressedData, "utf8");
+                console.log("Session decompressed successfully.");
+            } else {
+                throw new Error("Invalid session format");
+            }
+        }
+    } catch (e) {
+        console.error("Session Invalid:", e.message);
+    }
+}
+
+authentification();
+
+module.exports = router;
