@@ -1,207 +1,240 @@
-const zlib = require('zlib');
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
+const { makeid } = require('./gen-id');
+const { upload } = require('./mega');
 const pino = require("pino");
-const { makeid } = require('./id');
-const fetch = require('node-fetch');
-const {
-    default: Ibrahim_Adams,
-    useMultiFileAuthState,
-    delay,
+const { 
+    makeWASocket, 
+    useMultiFileAuthState, 
+    delay, 
+    Browsers, 
     makeCacheableSignalKeyStore,
-} = require("maher-zubair-baileys");
+    DisconnectReason
+} = require('@whiskeysockets/baileys');
+const axios = require('axios');
 
-const router = express.Router();
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-let isChatbotActive = true;
+// Global state
+let botState = {
+    isChatbotActive: true,
+    currentSession: null,
+    lastBioUpdate: null
+};
 
+// Session configuration
+const SESSION_TEMP_DIR = './temp';
+const SESSION_PREFIX = 'CRISS-AI-';
+
+// Initialize Express
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Helper functions
 function removeFile(FilePath) {
-    if (fs.existsSync(FilePath)) fs.rmSync(FilePath, { recursive: true, force: true });
+    if (!fs.existsSync(FilePath)) return false;
+    fs.rmSync(FilePath, { recursive: true, force: true });
 }
 
-function getCurrentDateTime() {
-    const options = {
-        timeZone: 'Africa/Nairobi',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-    };
-    return new Intl.DateTimeFormat('en-KE', options).format(new Date());
+function selectRandomItem(array) {
+    return array[Math.floor(Math.random() * array.length)];
 }
 
-async function startAutoBioUpdate(bot) {
-    setInterval(async () => {
-        const bioText = `BWM XMD is online! 🚀\n"${getCurrentDateTime()}"`;
-        await bot.updateProfileStatus(bioText);
-        console.log(`Updated Bio: ${bioText}`);
-    }, 60000);
+function generateRandomSessionId() {
+    const prefix = "3EB";
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let randomText = prefix;
+    for (let i = prefix.length; i < 22; i++) {
+        randomText += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return randomText;
 }
 
-async function handleChatbotMessage(bot, message) {
-    const remoteJid = message.key.remoteJid;
-    const messageContent = message.message.conversation || message.message.extendedTextMessage?.text;
+// 1. Session Initialization
+async function initializeWhatsAppSession() {
+    const sessionId = makeid();
+    const sessionDir = path.join(SESSION_TEMP_DIR, sessionId);
+    
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    
+    const sock = makeWASocket({
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" })),
+        },
+        printQRInTerminal: false,
+        generateHighQualityLinkPreview: true,
+        logger: pino({ level: "fatal" }),
+        syncFullHistory: false,
+        browser: Browsers.macOS(selectRandomItem(["Safari"]))
+    });
 
-    if (message.key.fromMe || !messageContent) return;
+    sock.ev.on('creds.update', saveCreds);
+    
+    return { sock, sessionDir };
+}
 
-    try {
-        const apiUrl = 'https://api.gurusensei.workers.dev/llama';
-        const response = await fetch(`${apiUrl}?prompt=${encodeURIComponent(messageContent)}`);
-        const data = await response.json();
+// 2. Chatbot Core Functionality
+async function setupChatbotHandlers(sock) {
+    // Message handler
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const message = messages[0];
+        if (!message.message) return;
 
-        if (data?.response?.response) {
-            let replyText = data.response.response;
+        const text = message.message.conversation || '';
+        const sender = message.key.remoteJid;
 
-            // For WhatsApp-like poll structure
-            const lines = replyText.split('\n');
-            let formattedPoll = "";
-            for (let line of lines) {
-                if (line.includes('%')) {
-                    // Emulate WhatsApp poll format
-                    formattedPoll += `▢ ${line}\n`;
-                } else {
-                    formattedPoll += `*${line}*\n\n`;
-                }
-            }
+        // Command handling
+        if (text.startsWith('!')) {
+            await handleCommand(sock, sender, text);
+            return;
+        }
 
-            await bot.sendPresenceUpdate("composing", remoteJid);
+        // Regular message processing
+        if (botState.isChatbotActive) {
+            await processMessage(sock, sender, text);
+        }
+    });
+
+    // Connection handler
+    sock.ev.on("connection.update", async (update) => {
+        const { connection, lastDisconnect } = update;
+        
+        if (connection === "open") {
+            console.log(`✅ Connected as ${sock.user.id}`);
+            
+            // Auto-bio update
+            setInterval(() => updateBio(sock), 60000);
+            
+            // Session backup
+            await backupSession(sock);
+        } 
+        else if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {
+            console.log("Connection closed, reconnecting...");
             await delay(1000);
-
-            await bot.sendMessage(remoteJid, { text: formattedPoll.trim() });
-        } else {
-            throw new Error("Invalid GPT response");
+            setupChatbotHandlers(sock);
         }
-    } catch (err) {
-        console.error("CHATBOT Error:", err.message);
-        await bot.sendMessage(remoteJid, {
-            text: "Sorry, I couldn't process your message. Please try again later."
+    });
+}
+
+// 3. Command Handling
+async function handleCommand(sock, sender, command) {
+    command = command.toLowerCase().trim();
+    
+    switch(command) {
+        case '!chatbot on':
+            botState.isChatbotActive = true;
+            await sock.sendMessage(sender, { text: '🤖 Chatbot activated' });
+            break;
+            
+        case '!chatbot off':
+            botState.isChatbotActive = false;
+            await sock.sendMessage(sender, { text: '🤖 Chatbot deactivated' });
+            break;
+            
+        case '!status':
+            const status = botState.isChatbotActive ? 'active ✅' : 'inactive ❌';
+            await sock.sendMessage(sender, { 
+                text: `Bot Status: ${status}\nLast Bio Update: ${botState.lastBioUpdate || 'Never'}` 
+            });
+            break;
+            
+        default:
+            await sock.sendMessage(sender, { text: 'Unknown command. Try !chatbot on/off' });
+    }
+}
+
+// 4. Message Processing
+async function processMessage(sock, sender, text) {
+    try {
+        const response = await axios.post('https://api.gurusensei.workers.dev/llama', {
+            message: text
         });
-    }
-}
 
-async function handleCommand(bot, message) {
-    const remoteJid = message.key.remoteJid;
-    const messageContent = message.message.conversation || message.message.extendedTextMessage?.text;
-
-    if (messageContent.startsWith('!chatbot')) {
-        const args = messageContent.split(' ');
-        const command = args[1];
-
-        if (command === 'on') {
-            isChatbotActive = true;
-            await bot.sendMessage(remoteJid, { text: 'Chatbot has been activated!' });
-        } else if (command === 'off') {
-            isChatbotActive = false;
-            await bot.sendMessage(remoteJid, { text: 'Chatbot has been deactivated!' });
-        } else {
-            await bot.sendMessage(remoteJid, { text: 'Usage: !chatbot [on/off]' });
-        }
-    }
-}
-
-router.get('/', async (req, res) => {
-    const id = makeid();
-    const num = req.query.number.replace(/[^0-9]/g, '');
-
-    async function BWM_XMD_PAIR_CODE() {
-        const sessionPath = __dirname + "/Session";
-        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-
-        try {
-            let Pair_Code_By_Ibrahim_Adams = Ibrahim_Adams({
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-                },
-                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-                browser: ["Chrome (Linux)", "", ""]
-            });
-
-            Pair_Code_By_Ibrahim_Adams.ev.on('creds.update', saveCreds);
-
-            Pair_Code_By_Ibrahim_Adams.ev.on("connection.update", async (s) => {
-                const { connection, lastDisconnect } = s;
-
-                if (connection === "close" && lastDisconnect?.error?.output?.statusCode != 401) {
-                    console.log("Reconnecting...");
-                    await delay(10000);
-                    BWM_XMD_PAIR_CODE();
+        await sock.sendMessage(sender, { 
+            text: response.data.response,
+            contextInfo: {
+                externalAdReply: {
+                    title: "CRISS-AI Response",
+                    body: "Powered by Llama API",
+                    thumbnailUrl: "https://files.catbox.moe/gs8gi2.jpg",
+                    sourceUrl: "https://whatsapp.com/channel/0029Vb0HIV2G3R3s2II4181g"
                 }
-
-                if (connection === "open") {
-                    console.log("Connected successfully!");
-                    startAutoBioUpdate(Pair_Code_By_Ibrahim_Adams);
-
-                    await Pair_Code_By_Ibrahim_Adams.sendMessage(Pair_Code_By_Ibrahim_Adams.user.id, {
-                        text: "Bot is successfully connected and session is retained!"
-                    });
-
-                    res.send({ message: "Bot connected successfully and session retained." });
-                }
-            });
-
-            if (!Pair_Code_By_Ibrahim_Adams.authState.creds.registered) {
-                const code = await Pair_Code_By_Ibrahim_Adams.requestPairingCode(num);
-                console.log("Pairing code generated:", code);
-                res.send({ pairingCode: code });
             }
+        });
+    } catch (error) {
+        console.error('API error:', error);
+        await sock.sendMessage(sender, { text: '⚠️ Error processing your message' });
+    }
+}
 
-            Pair_Code_By_Ibrahim_Adams.ev.on("messages.upsert", async (m) => {
-                const { messages } = m;
-                const ms = messages[0];
-
-                if (!ms.message) return;
-
-                const messageType = Object.keys(ms.message)[0];
-                const remoteJid = ms.key.remoteJid;
-
-                if (ms.key.remoteJid === "status@broadcast") {
-                    await Pair_Code_By_Ibrahim_Adams.readMessages([ms.key]);
-                }
-
-                if (messageType === "conversation" || messageType === "extendedTextMessage") {
-                    await Pair_Code_By_Ibrahim_Adams.sendPresenceUpdate("composing", remoteJid);
-                    await handleCommand(Pair_Code_By_Ibrahim_Adams, ms);
-                    if (isChatbotActive) await handleChatbotMessage(Pair_Code_By_Ibrahim_Adams, ms);
+// 5. Session Backup
+async function backupSession(sock) {
+    try {
+        const sessionId = generateRandomSessionId();
+        const credsPath = path.join(SESSION_TEMP_DIR, sock.user.id, 'creds.json');
+        
+        if (fs.existsSync(credsPath)) {
+            const megaUrl = await upload(fs.createReadStream(credsPath), `${sessionId}.json`);
+            const sessionCode = SESSION_PREFIX + megaUrl.replace('https://mega.nz/file/', '');
+            
+            await sock.sendMessage(sock.user.id, { 
+                text: sessionCode,
+                contextInfo: {
+                    externalAdReply: {
+                        title: "Session Backup",
+                        thumbnailUrl: "https://files.catbox.moe/gs8gi2.jpg",
+                        sourceUrl: "https://github.com/criss-vevo/CRISS-AI"
+                    }
                 }
             });
-        } catch (err) {
-            console.log("Service restarted due to an error:", err.message);
-            removeFile(sessionPath + "/creds.json");
-            if (!res.headersSent) res.send({ error: "Service is Currently Unavailable" });
+            
+            botState.currentSession = sessionCode;
         }
+    } catch (error) {
+        console.error('Session backup failed:', error);
     }
+}
 
-    return BWM_XMD_PAIR_CODE();
+// 6. Bio Update
+async function updateBio(sock) {
+    try {
+        const now = new Date().toLocaleString();
+        await sock.updateProfileStatus(`🤖 Active | ${now}`);
+        botState.lastBioUpdate = now;
+    } catch (error) {
+        console.error('Bio update failed:', error);
+    }
+}
+
+// Main initialization
+async function startBot() {
+    try {
+        const { sock, sessionDir } = await initializeWhatsAppSession();
+        botState.currentSession = sessionDir;
+        
+        await setupChatbotHandlers(sock);
+        
+        // Cleanup on exit
+        process.on('exit', () => {
+            removeFile(sessionDir);
+        });
+        
+        return sock;
+    } catch (error) {
+        console.error('Bot initialization failed:', error);
+        process.exit(1);
+    }
+}
+
+// Start the server and bot
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    startBot().then(() => {
+        console.log('WhatsApp bot initialized');
+    });
 });
 
-async function authentification() {
-    const sessionPath = __dirname + "/Session/creds.json";
-
-    try {
-        if (!fs.existsSync(sessionPath)) {
-            console.log("No existing session found...");
-        } else {
-            console.log("Existing session found...");
-            const sessionData = fs.readFileSync(sessionPath, "utf8");
-            const [header, b64data] = sessionData.split(';;;');
-
-            if (header === "BWM-XMD" && b64data) {
-                let compressedData = Buffer.from(b64data.replace('...', ''), 'base64');
-                let decompressedData = zlib.gunzipSync(compressedData);
-                fs.writeFileSync(sessionPath, decompressedData, "utf8");
-            } else {
-                throw new Error("Invalid session format");
-            }
-        }
-    } catch (e) {
-        console.error("Session Invalid:", e.message);
-    }
-}
-
-authentification();
-
-module.exports = router;
+module.exports = app;
