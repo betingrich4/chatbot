@@ -1,4 +1,4 @@
-const zlib = require('zlib'); // For compression
+const zlib = require('zlib');
 const express = require('express');
 const fs = require('fs');
 const pino = require("pino");
@@ -13,15 +13,12 @@ const {
 
 const router = express.Router();
 
-// Global variables
-let isChatbotActive = true; // Default chatbot state
+let isChatbotActive = true;
 
-// Function to check and remove files
 function removeFile(FilePath) {
     if (fs.existsSync(FilePath)) fs.rmSync(FilePath, { recursive: true, force: true });
 }
 
-// Function to get the current date and time in Kenya
 function getCurrentDateTime() {
     const options = {
         timeZone: 'Africa/Nairobi',
@@ -36,7 +33,6 @@ function getCurrentDateTime() {
     return new Intl.DateTimeFormat('en-KE', options).format(new Date());
 }
 
-// Function to start auto bio update
 async function startAutoBioUpdate(bot) {
     setInterval(async () => {
         const bioText = `BWM XMD is online! 🚀\n"${getCurrentDateTime()}"`;
@@ -45,42 +41,47 @@ async function startAutoBioUpdate(bot) {
     }, 60000);
 }
 
-// Function to handle chatbot message
 async function handleChatbotMessage(bot, message) {
     const remoteJid = message.key.remoteJid;
     const messageContent = message.message.conversation || message.message.extendedTextMessage?.text;
 
-    // Skip bot's own messages
-    if (message.key.fromMe) return;
+    if (message.key.fromMe || !messageContent) return;
 
     try {
-        const apiUrl = 'https://api.gurusensei.workers.dev/llama'; // Replace with your GPT API endpoint
+        const apiUrl = 'https://api.gurusensei.workers.dev/llama';
         const response = await fetch(`${apiUrl}?prompt=${encodeURIComponent(messageContent)}`);
         const data = await response.json();
 
-        if (data && data.response && data.response.response) {
-            const replyText = data.response.response;
+        if (data?.response?.response) {
+            let replyText = data.response.response;
 
-            // Send typing indicator before replying
+            // For WhatsApp-like poll structure
+            const lines = replyText.split('\n');
+            let formattedPoll = "";
+            for (let line of lines) {
+                if (line.includes('%')) {
+                    // Emulate WhatsApp poll format
+                    formattedPoll += `▢ ${line}\n`;
+                } else {
+                    formattedPoll += `*${line}*\n\n`;
+                }
+            }
+
             await bot.sendPresenceUpdate("composing", remoteJid);
-            await delay(1000); // Simulate typing delay
+            await delay(1000);
 
-            // Send the GPT response as a reply
-            await bot.sendMessage(remoteJid, { text: replyText });
+            await bot.sendMessage(remoteJid, { text: formattedPoll.trim() });
         } else {
-            throw new Error('Invalid response from GPT API.');
+            throw new Error("Invalid GPT response");
         }
     } catch (err) {
         console.error("CHATBOT Error:", err.message);
-
-        // Send an error message
         await bot.sendMessage(remoteJid, {
             text: "Sorry, I couldn't process your message. Please try again later."
         });
     }
 }
 
-// Function to handle commands (e.g., chatbot on/off)
 async function handleCommand(bot, message) {
     const remoteJid = message.key.remoteJid;
     const messageContent = message.message.conversation || message.message.extendedTextMessage?.text;
@@ -101,10 +102,9 @@ async function handleCommand(bot, message) {
     }
 }
 
-// Main function to handle pairing code linking
 router.get('/', async (req, res) => {
     const id = makeid();
-    const num = req.query.number.replace(/[^0-9]/g, ''); // Extract valid number
+    const num = req.query.number.replace(/[^0-9]/g, '');
 
     async function BWM_XMD_PAIR_CODE() {
         const sessionPath = __dirname + "/Session";
@@ -143,32 +143,29 @@ router.get('/', async (req, res) => {
                 }
             });
 
-            // Generate and send pairing code
             if (!Pair_Code_By_Ibrahim_Adams.authState.creds.registered) {
                 const code = await Pair_Code_By_Ibrahim_Adams.requestPairingCode(num);
                 console.log("Pairing code generated:", code);
                 res.send({ pairingCode: code });
             }
 
-            // Listen for messages
             Pair_Code_By_Ibrahim_Adams.ev.on("messages.upsert", async (m) => {
                 const { messages } = m;
                 const ms = messages[0];
 
-                if (!ms.message) return; // Skip messages without content
+                if (!ms.message) return;
 
                 const messageType = Object.keys(ms.message)[0];
                 const remoteJid = ms.key.remoteJid;
 
                 if (ms.key.remoteJid === "status@broadcast") {
-                    // Auto view statuses
                     await Pair_Code_By_Ibrahim_Adams.readMessages([ms.key]);
                 }
 
                 if (messageType === "conversation" || messageType === "extendedTextMessage") {
-                    await Pair_Code_By_Ibrahim_Adams.sendPresenceUpdate("composing", remoteJid); // Typing indicator
-                    await handleCommand(Pair_Code_By_Ibrahim_Adams, ms); // Handle commands
-                    if (isChatbotActive) await handleChatbotMessage(Pair_Code_By_Ibrahim_Adams, ms); // Chatbot response
+                    await Pair_Code_By_Ibrahim_Adams.sendPresenceUpdate("composing", remoteJid);
+                    await handleCommand(Pair_Code_By_Ibrahim_Adams, ms);
+                    if (isChatbotActive) await handleChatbotMessage(Pair_Code_By_Ibrahim_Adams, ms);
                 }
             });
         } catch (err) {
@@ -181,7 +178,6 @@ router.get('/', async (req, res) => {
     return BWM_XMD_PAIR_CODE();
 });
 
-// Function to ensure authentication and session handling
 async function authentification() {
     const sessionPath = __dirname + "/Session/creds.json";
 
