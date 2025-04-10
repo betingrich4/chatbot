@@ -1,0 +1,22 @@
+{
+    "name": "bwm xmd scanner",
+    "description": "Bwm xmd scanner by Ibrahim Adams",
+    "logo": "https://files.catbox.moe/7ux2i3.webp",
+    "repository": "https://github.com/devibrah/bwm-xmd-scanner",
+    "keywords": ["Bwmxmd"],
+    "success_url": "/", 
+    "buildpacks": [{ "url": "https://github.com/heroku/heroku-buildpack-nodejs#latest" } ],
+    "env": {      
+      "PORT": {
+        "description": "Port for web app.4000,5000,3000... any!",
+        "value": "5000",
+        "required": false 
+      },
+      "MESSAGE": {
+        "description": "set session id conformation message",
+        "value": "",
+        "required": false 
+      }
+    }   
+
+}
